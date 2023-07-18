@@ -18,17 +18,20 @@ function setAction(tab, currentState) {
   }
   let setTitle = (title) => titleInputs.title = title;
 
-  let finalElapsedSeconds = ((currentState.endTime - currentState.startTime) / 1000).toFixed(2); // 2 decimal places
+  let finalElapsed = getElapsedString(currentState.startTime, currentState.endTime);
 
   if (currentState.running) {
     setIconPath("blue");
     setTitle(`Periodically scanning for the rerun button. Click to cancel. (retries: ${currentState.retries})`);
+  } else if (currentState.cancelled) {
+    setIconPath("cancel");
+    setTitle(`Automatic retry was cancelled. (reason: '${currentState.cancellationReason}', retries: ${currentState.retries}), elapsed: ${finalElapsed}`);
   } else if (currentState.finished && currentState.status === "success") {
     setIconPath("green");
-    setTitle(`Pipeline succeeded. (retries: ${currentState.retries}, elapsed: ${finalElapsedSeconds})`);
+    setTitle(`Pipeline succeeded. (retries: ${currentState.retries}, elapsed: ${finalElapsed})`);
   } else if (currentState.finished) {
     setIconPath("red");
-    setTitle(`Pipeline failed or script timed out. (retries: ${currentState.retries}, elapsed: ${finalElapsedSeconds})`);
+    setTitle(`Pipeline failed or script timed out. (retries: ${currentState.retries}, elapsed: ${finalElapsed})`);
   } else {
     setIconPath("default");
     setTitle("Rerun failed jobs");
@@ -39,6 +42,22 @@ function setAction(tab, currentState) {
 
   // Set the displayed "title" (tooltip).
   chrome.action.setTitle(titleInputs);
+
+}
+
+function getElapsedString(startTimeMillis, endTimeMillis) {
+
+  let seconds = (endTimeMillis - startTimeMillis) / 1000;
+  let hours = Math.floor(seconds / 3600);
+  seconds = seconds % 3600;
+  let minutes = Math.floor(seconds / 60);
+  seconds = Math.floor(seconds % 60);
+
+  let hh = hours < 10 ? `0${hours}` : `${hours}`;
+  let mm = minutes < 10 ? `0${minutes}` : `${minutes}`;
+  let ss = seconds < 10 ? `0${seconds}` : `${seconds}`;
+
+  return `${hh}:${mm}:${ss}`;
 
 }
 

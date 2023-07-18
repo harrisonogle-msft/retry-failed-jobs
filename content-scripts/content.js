@@ -7,23 +7,20 @@ class JobStatus {
 
 async function main() {
 
-  logger.log(`Starting extension. (extension id: ${chrome.runtime.id})`);
+  logger.log(`Extension started. (extension id: ${chrome.runtime.id})`);
 
   const loop = new RerunManager();
-  let initialized = false;
 
   /**
    * Listen to messages from the background script (thing which handles events from the extension button).
    */
   chrome.runtime.onMessage.addListener(async function (message) {
 
-    console.log(`Received message from background script: ${JSON.stringify(message, null, 4)}`);
-
     switch (message.type) {
       case "action-clicked":
         if (loop.running) {
           logger.log("Extension action button was clicked. Cancelling...");
-          loop.cancel();
+          loop.cancel("cancelled by user");
         } else {
           logger.log("Extension action button was clicked. Starting...");
           loop.start();
@@ -36,16 +33,26 @@ async function main() {
 
   });
 
-  if (!loop.running) {
-    loop.start();
+  // Since we're web scraping, do a dry run to make sure the elements are still detectable.
+  // These warnings will appear if/when the HTML/CSS of the page is changed in a breaking manner.
+  let detectedJobStatus = loop.jobStatus;
+  if (detectedJobStatus === JobStatus.UNKNOWN) {
+
+    logger.warn(`Unable to detect the ADO pipeline job status based on the existing CSS selector ` +
+      `'${RerunManager.STATUS_ICON_SELECTOR}' and icon class list '[${RerunManager.STATUS_ICON_CLASSES}]'. ` +
+      `HTML/CSS detection may be broken.`);
+
+  } else if (detectedJobStatus === JobStatus.FAILED && !loop.detectButton(RerunManager.RETRY_BUTTON_TEXT)) {
+
+    logger.warn(`Unable to detect the retry button based on the text content '${RerunManager.RETRY_BUTTON_TEXT}'` +
+      `and the existing CSS selector '${RerunManager.BUTTON_SELECTOR}' despite the pipeline being in failure state. ` +
+      `HTML/CSS detection may be broken.`);
+
   }
 
-  // Sanity check.
-  if (!initialized) {
-    logger.log('Sending sanity check ping to background script.')
-    initialized = true;
-    let res = await chrome.runtime.sendMessage(chrome.runtime.id, { type: "ping", payload: "Content script started." });
-    logger.log(res);
+  if (!loop.running) {
+    logger.log("Extension action button was clicked. Starting...");
+    loop.start();
   }
 
   return loop.currentState;
@@ -70,16 +77,25 @@ async function getCurrentTab() {
  */
 class RerunManager {
 
-  static #ITER_DELAY_MILLIS = 60 * 1000;
-  static #TIMEOUT_MILLIS = 5 * 60 * 60 * 1000;
-  static #MAX_RETRY_COUNT = 3;
-  static #retryButtonText = "Rerun failed jobs";
-  static #confirmButtonText = "Yes";
+  // Behavioral constants
+  static MAX_RETRY_COUNT = 8; // retry the failed jobs at most 8 times
+  static ITER_DELAY_MILLIS = 60 * 1000; // check for the retry button every minute
+  static TIMEOUT_MILLIS = 5 * 60 * 60 * 1000; // time out after 5 hours
 
-  #canceled = false;
-  #retries = 0;
+  // Web scraping element detection constants
+  static RETRY_BUTTON_TEXT = "Rerun failed jobs";
+  static CONFIRM_BUTTON_TEXT = "Yes";
+  static BUTTON_SELECTOR = "button > span";
+  static STATUS_ICON_SELECTOR = "svg.bolt-status";
+  static STATUS_ICON_CLASSES = [JobStatus.SUCCESS, JobStatus.FAILED, JobStatus.ACTIVE, "animate"];
+
+  // Private instance members
   #startTime = null;
   #endTime = null;
+  #retries = 0;
+  #cancelled = false;
+  #cancellationReason = null;
+  #cancellationNonce = null;
 
   constructor() {
   }
@@ -91,21 +107,23 @@ class RerunManager {
   get currentState() {
     return {
       running: this.running,
-      canceled: this.#canceled,
+      cancelled: this.#cancelled,
       finished: this.finished,
       status: this.jobStatus,
       startTime: (this.#startTime == null ? 0 : this.#startTime.getTime()), // timestamp with milliseconds precision
       endTime: (this.#endTime == null ? 0 : this.#endTime.getTime()), // timestamp with milliseconds precision
       retries: this.#retries,
-      elapsedMillis: this.elapsedMillis,
+      cancellationReason: this.#cancellationReason
     };
   }
 
-  #reset() {
-    this.#canceled = false;
-    this.#retries = 0;
+  resetState() {
     this.#startTime = null;
     this.#endTime = null;
+    this.#retries = 0;
+    this.#cancelled = false;
+    this.#cancellationReason = null;
+    this.#cancellationNonce = null;
   }
 
   /**
@@ -113,38 +131,43 @@ class RerunManager {
   */
   async start() {
 
-    logger.log("Starting main loop.");
-
-    this.#reset();
+    this.resetState();
     this.#startTime = new Date();
+    let nonce = uuidv4();
+    this.#cancellationNonce = nonce;
 
     // Automatically stop probing for the button after the timeout expires.
     setTimeout(() => {
-      logger.log(`Timeout reached. Cancelling...`);
-      this.#canceled = true;
-      this.#sendUpdate();
-    }, RerunManager.#TIMEOUT_MILLIS);
+      if (!this.#cancelled && this.#cancellationNonce === nonce) {
+        logger.log(`Timeout reached. Cancelling...`);
+        this.cancel("timed out");
+      }
+    }, RerunManager.TIMEOUT_MILLIS);
 
     // Send a current state update to the background script.
     this.#sendUpdate();
 
     while (this.#shouldRun) {
 
-      if (this.#findButtonAndClick(RerunManager.#retryButtonText)) {
+      let clicked = false;
+
+      if (this.#clickButton(RerunManager.RETRY_BUTTON_TEXT)) {
 
         // Wait for a second before checking for the confirmation modal.
         // Could replace with something like [webdriver waits](https://www.selenium.dev/documentation/webdriver/waits/)
         // but the 1 second static delay really doesn't matter here.
         await Task.Delay(1000);
 
-        if (this.#findButtonAndClick(RerunManager.#confirmButtonText)) {
+        if (this.#clickButton(RerunManager.CONFIRM_BUTTON_TEXT)) {
           this.#retries++;
-          logger.log(`Executing retry number ${this.#retries}...`);
+          clicked = true;
+          logger.log(`Executing retry. (${this.#retries}/${RerunManager.MAX_RETRY_COUNT})`);
+          this.#sendUpdate();
         } else {
           logger.warn("Clicked retry button, but was unable to click the confirm button.");
         }
       } else {
-        let status = this.jobStatus;
+        let status = this.jobStatus; // pin it
         if (status !== JobStatus.SUCCESS && status !== JobStatus.ACTIVE) {
           // If pipeline status is "failed", the button is supposed to be present.
           // This warning will appear if/when the HTML/CSS for the button changes
@@ -153,9 +176,25 @@ class RerunManager {
         }
       }
 
-      // No CancellationTokens in JS
+      // Wait for the ADO job status to be active.
+      // It takes quite a few seconds for ADO to submit the job and update the page.
+      if (clicked) {
+        let waitForPageToRespondTimeout = 30 * 1000;
+        let timeout = new Date().getTime() + waitForPageToRespondTimeout;
+        if (!this.#cancelled && this.jobStatus !== JobStatus.ACTIVE && new Date().getTime() < timeout) {
+          logger.log("Button was clicked; waiting for ADO to update the job status...");
+          do {
+            await Task.Delay(1000);
+          } while (!this.#cancelled && this.jobStatus !== JobStatus.ACTIVE && new Date().getTime() < timeout);
+          if (this.jobStatus === JobStatus.ACTIVE) {
+            logger.log("ADO job started.");
+          }
+        }
+      }
+
+      // Sleep for the iteration delay, supporting cancellation (no CancellationTokens in JS).
       let sleepStart = new Date().getTime();
-      while (this.#shouldRun && (new Date().getTime() - sleepStart) < RerunManager.#ITER_DELAY_MILLIS) {
+      while (this.#shouldRun && (new Date().getTime() - sleepStart) < RerunManager.ITER_DELAY_MILLIS) {
         await Task.Delay(1000);
       }
 
@@ -170,11 +209,16 @@ class RerunManager {
 
     // The last retry attempt was submitted, but the pipeline is
     // still running, so wait for it to finish before exiting.
-    while (!this.#canceled && this.jobStatus === JobStatus.ACTIVE) {
-      await Task.Delay(1000);
+    if (!this.#cancelled && this.jobStatus === JobStatus.ACTIVE) {
+      logger.info("Last retry attempt submitted. Waiting for the ADO job to finish...");
+      do {
+        await Task.Delay(1000);
+      } while (!this.#cancelled && this.jobStatus === JobStatus.ACTIVE);
     }
 
-    this.#endTime = new Date();
+    if (!this.#cancelled) {
+      this.#endTime = new Date();
+    }
     logger.log(`Exiting main loop (retries: ${this.#retries}, elapsed: ${(this.elapsedMillis / 1000.0).toFixed(2)}s)`);
     logger.log(this);
 
@@ -193,15 +237,18 @@ class RerunManager {
   /**
    * Cancel the current execution. Allows for graceful shutdown.
    */
-  cancel() {
-    this.#canceled = true;
+  cancel(reason) {
+    this.#endTime = new Date();
+    this.#cancelled = true;
+    this.#cancellationReason = reason;
+    this.#sendUpdate();
   }
 
   /**
    * Whether or not the main loop should continue.
    */
   get #shouldRun() {
-    return !this.#canceled && this.#retries < RerunManager.#MAX_RETRY_COUNT;
+    return !this.#cancelled && this.#retries < RerunManager.MAX_RETRY_COUNT;
   }
 
   /**
@@ -215,7 +262,7 @@ class RerunManager {
    * Whether the main loop has finished on its own (without being user-cancelled).
    */
   get finished() {
-    return this.#endTime != null;
+    return this.#endTime != null && !this.#cancelled;
   }
 
   /**
@@ -236,57 +283,60 @@ class RerunManager {
    */
   get jobStatus() {
 
-    let cssSelector = "svg.bolt-status";
-    let iconClasses = [JobStatus.SUCCESS, JobStatus.FAILED, JobStatus.ACTIVE, "animate"];
-;
-    let detected = JobStatus.UNKNOWN;
+    let status = JobStatus.UNKNOWN;
 
     // Get the first pipeline status icon on the page.
-    let icon = document.querySelector(cssSelector);
+    let icon = document.querySelector(RerunManager.STATUS_ICON_SELECTOR);
 
     if (icon != null && icon.classList != null) {
 
       // Detect status using the icon's class list.
-      for (const clsName of iconClasses) {
+      for (const clsName of RerunManager.STATUS_ICON_CLASSES) {
         if (icon.classList.contains(clsName)) {
-          // return clsName;
-          detected = clsName;
+          status = clsName;
+          break;
         }
       }
 
       // Remap "animate" to "active" because they both indicate the same state (one is spinny, though).
-      if (detected === "animate") {
-        detected = JobStatus.ACTIVE;
+      if (status === "animate") {
+        status = JobStatus.ACTIVE;
       }
 
     }
 
-    if (detected === JobStatus.UNKNOWN) {
-      // This warning will appear if/when the HTML/CSS of the page is changed in a breaking manner.
-      logger.warn(`Unable to detect the ADO pipeline job status based on the existing CSS selector '${cssSelector}' and icon class list '${iconClasses}'`);
-    }
+    return status;
+  }
 
-    return detected;
+  #clickButton(textContent) {
+    return this.detectButton(textContent, btn => btn.click());
   }
 
   /**
-   * Find a button on the page by its child span's text content and click it.
+   * Detect a button on the page by its child span's text content and perform the given action on it.
    * If multiple such buttons are found, only the first will be clicked.
-   * @param {The text content} textContent 
+   * @param {The text content to match} textContent 
+   * @param {Action to perform on the found button} textContent 
    */
-  #findButtonAndClick(textContent) {
+  detectButton(textContent, action = btn => { }) {
 
-    // If there are multiple buttons, only the first will be clicked.
-    let clicked = false;
+    // If there are multiple buttons, only the first will be considered.
+    let button = null;
 
-    document.querySelectorAll('button > span').forEach(el => {
-      if (!clicked && el.textContent.includes(textContent)) {
-        clicked = true;
-        el.click();
+    document.querySelectorAll(RerunManager.BUTTON_SELECTOR).forEach(el => {
+      if (!button && el.textContent.includes(textContent)) {
+        button = el;
       }
     });
 
-    return clicked;
+    let found = button !== null;
+
+    if (found) {
+      action(button);
+    }
+
+    return found;
+
   }
 
 }
@@ -315,6 +365,16 @@ class Task {
   static async Delay(millis) {
     await new Promise(resolve => setTimeout(resolve, millis));
   }
+}
+
+/**
+ * Helper function to generate a guid.
+ * @returns a guid
+ */
+function uuidv4() {
+  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+    (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
+  );
 }
 
 // This top-level expression is returned as a frame result
