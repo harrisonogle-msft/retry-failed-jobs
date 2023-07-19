@@ -24,7 +24,7 @@ function setAction(tab, currentState) {
     setIconPath("blue");
     setTitle(`Periodically scanning for the rerun button. Click to cancel. (retries: ${currentState.retries})`);
   } else if (currentState.cancelled) {
-    setIconPath("cancel");
+    setIconPath("default");
     setTitle(`Automatic retry was cancelled. (reason: '${currentState.cancellationReason}', retries: ${currentState.retries}), elapsed: ${finalElapsed}`);
   } else if (currentState.finished && currentState.status === "success") {
     setIconPath("green");
@@ -42,7 +42,6 @@ function setAction(tab, currentState) {
 
   // Set the displayed "title" (tooltip).
   chrome.action.setTitle(titleInputs);
-
 }
 
 function getElapsedString(startTimeMillis, endTimeMillis) {
@@ -58,7 +57,6 @@ function getElapsedString(startTimeMillis, endTimeMillis) {
   let ss = seconds < 10 ? `0${seconds}` : `${seconds}`;
 
   return `${hh}:${mm}:${ss}`;
-
 }
 
 /**
@@ -98,7 +96,6 @@ async function onActionClicked(tab) {
 
   console.log(`Received state update: ${JSON.stringify(res, null, 4)}`);
   return res;
-
 }
 
 /**
@@ -120,7 +117,6 @@ async function startContentScript(tab) {
   console.log(`Frame ${frameId} result:`, result);
 
   return result;
-
 }
 
 /**
@@ -157,7 +153,6 @@ chrome.action.onClicked.addListener(async (tab) => {
   if (currentState != null) {
     handleStateUpdate(tab, currentState);
   }
-
 });
 
 /**
@@ -183,11 +178,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   function handlePing(message, sender, sendResponse) {
     sendResponse({
-      type: "pong",
+      tabId: sender.tab.id,
       payload: {
         originalMessage: message
       }
     });
   }
+});
 
+/**
+ * 
+ * @param {*} tabId 
+ * @param {*} changeInfo 
+ * @param {*} tabInfo 
+ */
+function handleUpdated(tabId, changeInfo, tabInfo) {
+}
+
+/**
+ * Let the content script know the user navigated away so it can cancel polling and retry.
+ */
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tabInfo) => {
+  if (changeInfo.url) {
+    console.log(`Tab: ${tabId} URL changed.`);;
+    await chrome.tabs.sendMessage(
+      tabId,
+      {
+        type: "url-updated",
+        payload: { tabId, url: changeInfo.url }
+      }
+    );
+  }
 });

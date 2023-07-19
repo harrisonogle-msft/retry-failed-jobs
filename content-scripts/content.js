@@ -2,6 +2,7 @@ class JobStatus {
   static SUCCESS = "success";
   static FAILED = "failed";
   static ACTIVE = "active";
+  static CANCELLED = "cancelled";
   static UNKNOWN = "unknown";
 }
 
@@ -9,12 +10,13 @@ async function main() {
 
   logger.log(`Extension started. (extension id: ${chrome.runtime.id})`);
 
-  const loop = new RerunManager();
+  let tabId = (await chrome.runtime.sendMessage({ type: "ping" })).tabId;
+  let loop = new RerunManager();
 
   /**
    * Listen to messages from the background script (thing which handles events from the extension button).
    */
-  chrome.runtime.onMessage.addListener(async function (message) {
+  chrome.runtime.onMessage.addListener(async function (message, sender) {
 
     switch (message.type) {
       case "action-clicked":
@@ -26,11 +28,16 @@ async function main() {
           loop.start();
         }
         break;
+      case "url-updated":
+        if (loop.running && tabId === message.payload.tabId) {
+          logger.log("User navigated away from the original page. Cancelling...");
+          loop.cancel("URL changed");
+        }
+        break;
       default:
         console.log(`Unable to parse message of type '${(message.type == null ? "(null or undefined)" : message.type)}'`);
         break;
     }
-
   });
 
   // Since we're web scraping, do a dry run to make sure the elements are still detectable.
@@ -87,7 +94,8 @@ class RerunManager {
   static CONFIRM_BUTTON_TEXT = "Yes";
   static BUTTON_SELECTOR = "button > span";
   static STATUS_ICON_SELECTOR = "svg.bolt-status";
-  static STATUS_ICON_CLASSES = [JobStatus.SUCCESS, JobStatus.FAILED, JobStatus.ACTIVE, "animate"];
+  static STATUS_ICON_CLASSES = [JobStatus.SUCCESS, JobStatus.FAILED, JobStatus.ACTIVE, "animate", "neutral"];
+  static PR_TITLE_SELECTOR = '[role="heading"]';
 
   // Private instance members
   #startTime = null;
@@ -96,6 +104,9 @@ class RerunManager {
   #cancelled = false;
   #cancellationReason = null;
   #cancellationNonce = null;
+
+  // Save the original browser tab icon so it can be restored if necessary.
+  static #originalFaviconUrl = null;
 
   constructor() {
   }
@@ -188,6 +199,7 @@ class RerunManager {
           } while (!this.#cancelled && this.jobStatus !== JobStatus.ACTIVE && new Date().getTime() < timeout);
           if (this.jobStatus === JobStatus.ACTIVE) {
             logger.log("ADO job started.");
+            this.#sendUpdate();
           }
         }
       }
@@ -224,14 +236,21 @@ class RerunManager {
 
     // Send a current state update to the background script.
     this.#sendUpdate();
-
   }
 
   /**
    * Send a state update to the background script so it can update the extension popup visuals.
    */
   #sendUpdate() {
-    chrome.runtime.sendMessage({ type: "update-state", payload: this.currentState });
+    let currentState = this.currentState;
+    chrome.runtime.sendMessage({ type: "update-state", payload: currentState });
+    
+    // Update the browser tab icon with the status.
+    this.#changeFavicon(currentState.status);
+
+    // Update the tab tooltip (page title) with the state.
+    var prTitleEl = document.querySelector(RerunManager.PR_TITLE_SELECTOR);
+    document.title = `${(prTitleEl == null ? "" : prTitleEl.textContent + ' ')}(retries: ${this.#retries})`;
   }
 
   /**
@@ -298,11 +317,13 @@ class RerunManager {
         }
       }
 
-      // Remap "animate" to "active" because they both indicate the same state (one is spinny, though).
       if (status === "animate") {
+        // Remap "animate" to "active" because they both indicate the same state (one is spinny, though).
         status = JobStatus.ACTIVE;
+      } else if (status === "neutral") {
+        // Cancelled icon class is named "neutral".
+        status = JobStatus.CANCELLED;
       }
-
     }
 
     return status;
@@ -336,9 +357,57 @@ class RerunManager {
     }
 
     return found;
-
   }
 
+  /**
+   * Change the icon in the browser tab to match the current state of the pipeline.
+   * @param {The JobStatus of the ADO pipeline} jobStatus 
+   */
+  #changeFavicon(jobStatus) {
+
+    // Detect the favicon element.
+    let favicon = document.querySelector('link[rel*="icon"]');
+    if (favicon == null) {
+      // We can't change the favicon if the site didn't specify one.
+      return;
+    }
+
+    if (RerunManager.#originalFaviconUrl == null) {
+      // Save the original one in case we want to restore it.
+      RerunManager.#originalFaviconUrl = favicon.href;
+    }
+
+    if (this.#cancelled) {
+      favicon.href = RerunManager.#originalFaviconUrl;
+      return;
+    }
+
+    let iconPath = null;
+
+    switch (jobStatus) {
+      case JobStatus.ACTIVE:
+        iconPath = "/icons/favicons/blue.ico";
+        break;
+      case JobStatus.FAILED:
+        iconPath = "/icons/favicons/red.ico";
+        break;
+      case JobStatus.SUCCESS:
+        iconPath = "/icons/favicons/green.ico";
+        break;
+      default:
+        if (favicon.href !== RerunManager.#originalFaviconUrl) {
+          favicon.href = RerunManager.#originalFaviconUrl;
+        }
+        return;
+    }
+
+    if (iconPath != null) {
+      // Get a URL generated by the extension runtime to expose the local favicons.
+      let generatedFakeUrl = chrome.runtime.getURL(iconPath);
+      // Change the browser tab icon to match the current state of the pipeline.
+      favicon.href = generatedFakeUrl;
+    }
+  }
 }
 
 /**
