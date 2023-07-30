@@ -13,6 +13,16 @@ async function main() {
   let tabId = (await chrome.runtime.sendMessage({ type: "ping" })).tabId;
   let loop = new RerunManager();
 
+  let urlParams = new URLSearchParams(window.location.search);
+  let maxRetryCountParam = urlParams.get("maxRetryCount");
+  if (maxRetryCountParam != null) {
+    let maxRetryCount = parseInt(maxRetryCountParam);
+    if (!isNaN(maxRetryCount)) {
+      logger.log(`Changing max retry count from ${RerunManager.MAX_RETRY_COUNT} to user-specified value of ${maxRetryCount}.`);
+      RerunManager.MAX_RETRY_COUNT = maxRetryCount;
+    }
+  }
+
   /**
    * Listen to messages from the background script (thing which handles events from the extension button).
    */
@@ -85,7 +95,7 @@ async function getCurrentTab() {
 class RerunManager {
 
   // Behavioral constants
-  static MAX_RETRY_COUNT = 8; // retry the failed jobs at most 8 times
+  static MAX_RETRY_COUNT = 2; // retry the failed jobs at most 2 times
   static ITER_DELAY_MILLIS = 60 * 1000; // check for the retry button every minute
   static TIMEOUT_MILLIS = 5 * 60 * 60 * 1000; // time out after 5 hours
 
