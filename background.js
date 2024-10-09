@@ -108,7 +108,6 @@ async function startContentScript(tab) {
   let injectionResults = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     files: ["content-scripts/content.js"]
-    // files: ["content1.js"]
   });
 
   console.log(injectionResults.length);
